@@ -1,0 +1,181 @@
+import json
+import requests
+import pytz
+from datetime import datetime
+from difflib import SequenceMatcher
+import re
+import nltk
+from nltk.corpus import stopwords
+from nltk.tokenize import word_tokenize
+
+from telegram import Update
+from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
+
+# Chaves de API
+TOKEN_TELEGRAM = '7656877931:AAFPzQRuipLfAut9IlhULXpZr0azTI-lSXk'
+API_KEY_GOOGLE_MAPS = 'AIzaSyBXZzcP64u12c5f3etphHI1a0CnNwTQ5Kk'
+
+# Dicionário para converter nomes de estados para siglas
+estado_para_sigla = {
+    "State of Acre": "AC",
+    "State of Alagoas": "AL",
+    "State of Amapá": "AP",
+    "State of Amazonas": "AM",
+    "State of Bahia": "BA",
+    "State of Ceará": "CE",
+    "State of Espírito Santo": "ES",
+    "State of Goiás": "GO",
+    "State of Maranhão": "MA",
+    "State of Mato Grosso": "MT",
+    "State of Mato Grosso do Sul": "MS",
+    "State of Minas Gerais": "MG",
+    "State of Pará": "PA",
+    "State of Paraíba": "PB",
+    "State of Paraná": "PR",
+    "State of Pernambuco": "PE",
+    "State of Piauí": "PI",
+    "State of Rio de Janeiro": "RJ",
+    "State of Rio Grande do Norte": "RN",
+    "State of Rio Grande do Sul": "RS",
+    "State of Rondônia": "RO",
+    "State of Roraima": "RR",
+    "State of Santa Catarina": "SC",
+    "State of São Paulo": "SP",
+    "State of Sergipe": "SE",
+    "State of Tocantins": "TO",
+    "Federal District": "DF",
+    "Brazil": "Brasil"
+}
+
+def traduz_endereco(endereco):
+    for termo, sigla in estado_para_sigla.items():
+        endereco = endereco.replace(termo, sigla)
+    return endereco
+
+# Função para traduzir duração do inglês para português corretamente
+def traduz_duracao(texto):
+    texto = texto.replace('hours', 'horas')
+    texto = texto.replace('hour', 'hora')
+    texto = texto.replace('and', 'e')
+    texto = re.sub(r'\bmins\b', 'minutos', texto)
+    texto = re.sub(r'\bmin\b', 'minuto', texto)
+    return texto
+
+# Download dos dados necessários do NLTK
+try:
+    nltk.data.find('tokenizers/punkt')
+    nltk.data.find('corpora/stopwords')
+except LookupError:
+    nltk.download('punkt')
+    nltk.download('stopwords')
+
+# Função para extrair origem e destino da mensagem
+def extract_locations(text):
+    text = text.lower()
+    origem_markers = ['de', 'desde', 'partindo', 'saindo']
+    destino_markers = ['para', 'até', 'a', 'em']
+    text = text.replace('como está', '').replace('qual', '').replace('trânsito', '')
+    origem = None
+    destino = None
+    words = text.split()
+    for i, word in enumerate(words):
+        if word in origem_markers and i + 1 < len(words):
+            origem = ' '.join(words[i+1:])
+            for j, w in enumerate(words[i+1:]):
+                if w in destino_markers:
+                    origem = ' '.join(words[i+1:i+1+j])
+                    break
+        elif word in destino_markers and i + 1 < len(words):
+            destino = ' '.join(words[i+1:])
+            break
+    clean_words = [w for w in words if w not in origem_markers + destino_markers]
+    if not origem or not destino:
+        if len(clean_words) >= 2:
+            origem = clean_words[0]
+            destino = clean_words[-1]
+    if origem and 'brasil' not in origem:
+        origem += ', Brasil'
+    if destino and 'brasil' not in destino:
+        destino += ', Brasil'
+    return origem, destino
+
+# Função que classifica o trânsito
+def get_traffic_status(com_trafego, sem_trafego):
+    diferenca = com_trafego - sem_trafego
+    if diferenca < 300:
+        return "🟢 *Trânsito livre*", "Deslocamento rápido."
+    elif diferenca < 900:
+        return "🟡 *Trânsito moderado*", "Leves retenções no trajeto."
+    else:
+        return "🔴 *Trânsito pesado*", "Retenções significativas. Considere rotas alternativas."
+
+# Função principal que trata mensagens
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message is None or update.message.text is None:
+        return
+    text = update.message.text.lower()
+    origem, destino = extract_locations(text)
+
+    if origem and destino:
+        try:
+            url = f'https://maps.googleapis.com/maps/api/directions/json?origin={origem}&destination={destino}&mode=driving&departure_time=now&traffic_model=best_guess&key={API_KEY_GOOGLE_MAPS}'
+            response = requests.get(url)
+            data = json.loads(response.text)
+
+            if 'routes' in data and len(data['routes']) > 0 and data['status'] == 'OK':
+                main_route = data['routes'][0]['legs'][0]
+                alternative_routes = data['routes'][1:] if len(data['routes']) > 1 else []
+
+                distance = main_route['distance']['text']
+                duration = traduz_duracao(main_route['duration']['text'])
+                duration_in_traffic = main_route.get('duration_in_traffic', main_route['duration'])
+                duration_traduzida = traduz_duracao(duration_in_traffic['text'])
+
+                status, details = get_traffic_status(
+                    duration_in_traffic['value'],
+                    main_route['duration']['value']
+                )
+
+                maps_link = f"https://www.google.com/maps/dir/?api=1&origin={origem}&destination={destino}&travelmode=driving"
+
+                brasilia_tz = pytz.timezone('America/Sao_Paulo')
+                current_time = datetime.now(brasilia_tz).strftime('%H:%M - %d/%m/%Y')
+
+                origem_br = traduz_endereco(main_route['start_address'])
+                destino_br = traduz_endereco(main_route['end_address'])
+
+                message = f"""🚦 *SITUAÇÃO DO TRÂNSITO* 🚦\n\n*Origem:* {origem_br}\n*Destino:* {destino_br}\n\n📏 *Distância total:* {distance}\n⏱️ *Tempo estimado sem trânsito:* {duration}\n🕒 *Tempo estimado agora:* {duration_traduzida}\n{status}\n_{details}_\n\n*Confira no link o GPS:*"""
+
+                for i, route in enumerate(alternative_routes[:2], 1):
+                    alt_leg = route['legs'][0]
+                    alt_distance = alt_leg['distance']['text']
+                    alt_duration = traduz_duracao(alt_leg.get('duration_in_traffic', alt_leg['duration'])['text'])
+                    message += f"""\n\n➡️ *Alternativa {i}:*\n📏 Distância: {alt_distance}\n🕒 Tempo estimado: {alt_duration}"""
+
+                message += f"""\n\n🔗 [Abrir no Google Maps]({maps_link})\n
+                
+ 📅 Atualizado: {current_time}\n\n📍 _Informações Grupo BR 277_"""
+
+                await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text=message,
+                    parse_mode='Markdown'
+                )
+        except Exception as e:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text='⚠️ Ocorreu um erro ao buscar as informações. Tente novamente em instantes.'
+            )
+    else:
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text='Olá! Para consultar o trânsito, me diga os locais de origem e destino.\n\nExemplo: *de Curitiba para Londrina*.',
+            parse_mode='Markdown'
+        )
+
+# Execução do bot
+if __name__ == '__main__':
+    app = ApplicationBuilder().token(TOKEN_TELEGRAM).build()
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
+    print("Bot iniciado...")
+    app.run_polling()
